@@ -1,0 +1,38 @@
+# Planning docs (local only — README.md is tracked for GitHub)
+ROADMAP.md
+ARCHITECTURE.md
+docs/
+
+# Runtime data
+data/
+models/
+checkpoints/
+*.npz
+*.pt
+*.pth
+*.onnx
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.cursor/
+.vscode/
+*.log
+
+# Local config overrides (keep config.example.yaml tracked)
+config.yaml

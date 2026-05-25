@@ -1,0 +1,9 @@
+# Pinned for reproducible v1; bump intentionally after testing.
+opencv-python==4.10.0.84
+mediapipe==0.10.14
+numpy==1.26.4
+scikit-learn==1.5.2
+torch==2.5.1
+PyYAML==6.0.2
+pynput==1.7.7
+pygame==2.6.1

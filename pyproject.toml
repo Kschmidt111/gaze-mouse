@@ -1,0 +1,17 @@
+[project]
+name = "gaze-mouse"
+version = "0.1.0"
+description = "Webcam eye-gaze mouse control for Windows"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+gaze-mouse = "gaze_mouse.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
