@@ -2,6 +2,7 @@
 ROADMAP.md
 ARCHITECTURE.md
 docs/
+.cursor/rules/training-notes.mdc
 
 # Runtime data
 data/

@@ -2,16 +2,163 @@
 
 import argparse
 import ctypes
+import math
 import time
 from typing import Any, cast
 
 import cv2
+import joblib
 import numpy as np
 import pygame
 from mediapipe.python.solutions.face_mesh import FaceMesh
 from pathlib import Path
+from sklearn.linear_model import RidgeCV
+from sklearn.preprocessing import StandardScaler
 
-from gaze_mouse.config import AppConfig, load_config, project_root
+from pynput import keyboard, mouse
+
+from gaze_mouse.config import AppConfig, GazeConfig, load_config, project_root
+from gaze_mouse.features import FEATURE_VERSION, extract_feature_vector, feature_dim
+from gaze_mouse.training.metrics import mean_pixel_error
+from gaze_mouse.training.mlp import (
+    TrainResult,
+    load_mlp_predictor,
+    save_mlp_checkpoint,
+    train_gaze_mlp,
+)
+
+# Grid points held out for validation (same split for train, eval, run checks).
+DEFAULT_VAL_POINT_IDS: tuple[int, ...] = (2, 7)
+
+
+def default_val_point_ids(grid: str) -> tuple[int, ...]:
+    """Return calibration point ids to hold out for validation (~2 corners on 3x3)."""
+    rows, cols = parse_calibration_grid(grid)
+    if rows * cols >= 9:
+        return DEFAULT_VAL_POINT_IDS
+    return (rows * cols - 1,)
+
+
+def calibration_data_path(profile: str) -> Path:
+    return project_root() / "data" / "calibrations" / f"{profile}.npz"
+
+
+def model_artifact_path(profile: str) -> Path:
+    return project_root() / "models" / profile / "gaze_model.joblib"
+
+
+def mlp_checkpoint_path(profile: str) -> Path:
+    return project_root() / "models" / profile / "mlp.pt"
+
+
+def load_calibration_arrays(profile: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load X, y, point_ids from calibration npz; exit path should check is_file first."""
+    data = np.load(calibration_data_path(profile))
+    return data["X"], data["y"], data["point_ids"]
+
+
+def split_train_val(
+    X: np.ndarray,
+    y: np.ndarray,
+    point_ids: np.ndarray,
+    val_point_ids: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Split by entire calibration dots — never mix frames from the same dot."""
+    val_mask = np.isin(point_ids, val_point_ids)
+    return X[~val_mask], y[~val_mask], X[val_mask], y[val_mask]
+
+
+def save_gaze_artifact(
+    profile: str,
+    model: Any,
+    scaler: StandardScaler,
+    model_type: str,
+    val_point_ids: tuple[int, ...],
+) -> Path:
+    """Save model + scaler + metadata for eval and run."""
+    path = model_artifact_path(profile)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bundle: dict[str, Any] = {
+        "scaler": scaler,
+        "model_type": model_type,
+        "val_point_ids": np.asarray(val_point_ids, dtype=np.int32),
+    }
+    if model_type == "mlp":
+        bundle["model"] = None
+        bundle["y_scaler"] = model.y_scaler
+    else:
+        bundle["model"] = model
+    joblib.dump(bundle, path)
+    return path
+
+
+def load_gaze_artifact(profile: str) -> dict[str, Any]:
+    """Load bundled model artifact; raise clear errors if missing or legacy format."""
+    path = model_artifact_path(profile)
+    legacy = project_root() / "models" / f"{profile}.pkl"
+    if path.is_file():
+        bundle = joblib.load(path)
+        if not isinstance(bundle, dict) or "scaler" not in bundle:
+            raise RuntimeError(f"invalid gaze model artifact: {path}")
+        model_type = bundle.get("model_type", "ridge")
+        if model_type == "mlp":
+            ckpt = mlp_checkpoint_path(profile)
+            bundle["model"] = load_mlp_predictor(ckpt, y_scaler=bundle.get("y_scaler"))
+        elif bundle.get("model") is None:
+            raise RuntimeError(f"mlp checkpoint missing for profile {profile}; retrain with --model mlp")
+        return bundle
+    if legacy.is_file():
+        raise RuntimeError(
+            f"found old model at {legacy} (scaler missing). "
+            f"retrain: python -m gaze_mouse train --profile {profile} --model ridge"
+        )
+    raise FileNotFoundError(
+        f"no trained model at {path}. train first: python -m gaze_mouse train --profile {profile}"
+    )
+
+
+def predict_screen_position(
+    model: Any,
+    scaler: StandardScaler,
+    features: np.ndarray | list[float],
+) -> tuple[float, float]:
+    """Scale landmark features and predict screen (x, y) in pixels."""
+    row = np.asarray(features, dtype=np.float32).reshape(1, -1)
+    scaled = scaler.transform(row)
+    pred = model.predict(scaled)[0]
+    return float(pred[0]), float(pred[1])
+
+
+def apply_gaze_mapping(
+    raw_x: float,
+    raw_y: float,
+    screen_width: int,
+    screen_height: int,
+    gaze: GazeConfig,
+    prev_x: float | None,
+    prev_y: float | None,
+) -> tuple[float, float]:
+    """Apply center-relative gain, EMA smoothing, and max jump clamp."""
+    center_x = screen_width / 2.0
+    center_y = screen_height / 2.0
+    target_x = center_x + (raw_x - center_x) * gaze.gain_x
+    target_y = center_y + (raw_y - center_y) * gaze.gain_y
+    if prev_x is None or prev_y is None:
+        smooth_x, smooth_y = target_x, target_y
+    else:
+        alpha = gaze.smoothing_alpha
+        smooth_x = alpha * target_x + (1.0 - alpha) * prev_x
+        smooth_y = alpha * target_y + (1.0 - alpha) * prev_y
+        dx = smooth_x - prev_x
+        dy = smooth_y - prev_y
+        dist = float(np.hypot(dx, dy))
+        if dist > gaze.max_jump_px and dist > 0:
+            scale = gaze.max_jump_px / dist
+            smooth_x = prev_x + dx * scale
+            smooth_y = prev_y + dy * scale
+    clamped_x = float(np.clip(smooth_x, 0, screen_width - 1))
+    clamped_y = float(np.clip(smooth_y, 0, screen_height - 1))
+    return clamped_x, clamped_y
 
 
 def parse_calibration_grid(grid: str) -> tuple[int, int]:
@@ -46,16 +193,6 @@ def detect_face_landmarks(frame: Any, face_mesh: FaceMesh) -> Any | None:
     rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(rgb_image)
     return cast(Any, results).multi_face_landmarks
-
-
-def landmarks_to_feature_vector(multi_face_landmarks: Any) -> list[float]:
-    """Flatten the first face's landmark x/y into one numeric row for training."""
-    landmarks = multi_face_landmarks[0].landmark
-    features: list[float] = []
-    for landmark in landmarks:
-        features.append(landmark.x)
-        features.append(landmark.y)
-    return features
 
 
 def pygame_escape_pressed() -> bool:
@@ -146,6 +283,19 @@ def get_screen_size(mode: str) -> tuple[int, int]:
     return width, height
 
 
+def show_system_cursor() -> None:
+    """Ensure the OS cursor is visible (pygame/calibration can hide it on Windows)."""
+    ctypes.windll.user32.ShowCursor(True)
+
+
+def restore_cursor_to_center(screen_width: int, screen_height: int) -> None:
+    """Move cursor to screen center and force visible — recovery after run/calibrate."""
+    center_x = screen_width // 2
+    center_y = screen_height // 2
+    ctypes.windll.user32.SetCursorPos(center_x, center_y)
+    show_system_cursor()
+
+
 def cmd_calibrate(config: AppConfig, profile: str) -> int:
     """
     Parameters
@@ -175,7 +325,7 @@ def cmd_calibrate(config: AppConfig, profile: str) -> int:
     # Compute screen pixel center for each grid dot (10% inset from edges).
     dot_positions = calibration_dot_positions(rows, cols, screen_width, screen_height)
     # Lists that will become numpy arrays when we save the dataset.
-    feature_rows: list[list[float]] = []
+    feature_rows: list[np.ndarray] = []
     label_rows: list[list[int]] = []
     point_id_rows: list[int] = []
     # Start pygame for fullscreen calibration targets.
@@ -224,13 +374,12 @@ def cmd_calibrate(config: AppConfig, profile: str) -> int:
                 # Skip frames with no detected face (do not count toward quota).
                 if multi_face_landmarks is None:
                     continue
-                # Convert landmarks to a flat numeric feature vector.
-                feature_rows.append(landmarks_to_feature_vector(multi_face_landmarks))
-                # Label is the screen pixel the user was told to look at.
+                vec = extract_feature_vector(multi_face_landmarks)
+                if vec is None:
+                    continue
+                feature_rows.append(vec)
                 label_rows.append([target_x, target_y])
-                # Record which grid dot this sample belongs to.
                 point_id_rows.append(point_id)
-                # One more valid sample for this dot.
                 collected += 1
     finally:
         # Always release camera and MediaPipe resources.
@@ -238,12 +387,20 @@ def cmd_calibrate(config: AppConfig, profile: str) -> int:
         face_mesh.close()
         # Shut down pygame display and subsystems.
         pygame.quit()
+        screen_width, screen_height = get_screen_size(config.screen.mode)
+        restore_cursor_to_center(screen_width, screen_height)
     # Convert collected rows to numpy arrays for training.
     x_array = np.asarray(feature_rows, dtype=np.float32)
     y_array = np.asarray(label_rows, dtype=np.float32)
     point_ids_array = np.asarray(point_id_rows, dtype=np.int32)
     # Save dataset to disk (.npz = compressed numpy archive).
-    np.savez(output_path, X=x_array, y=y_array, point_ids=point_ids_array)
+    np.savez(
+        output_path,
+        X=x_array,
+        y=y_array,
+        point_ids=point_ids_array,
+        feature_version=np.int32(FEATURE_VERSION),
+    )
     # Tell the user where data was written and how many rows were saved.
     print(f"saved {len(feature_rows)} samples to {output_path}")
     # Successful calibration run.
@@ -270,30 +427,73 @@ def cmd_train(config: AppConfig, profile: str, model: str) -> int:
     int
         0 if trained and saved, non-zero on missing data or error.
     """
-    # --- Phase 3–4: train (not started) ---
-    #
-    # Goal: learn a mapping from face feature vectors → screen (x, y).
-    #   "Ridge" = simple sklearn linear model (baseline, fast).
-    #   "MLP" = small neural network in PyTorch (what you'll use for real control).
-    #
-    # TODO 1 — Load data/calibrations/{profile}.npz with numpy.load.
-    #   If file missing, print a message and return 1.
-    #
-    # TODO 2 — Split into train and validation sets BY CALIBRATION POINT:
-    #   Hold out ~2 entire dots (e.g. point ids 2 and 7), not random individual frames.
-    #   Why: consecutive frames at the same dot are nearly identical; random split would cheat.
-    #
-    # TODO 3 — If model == "ridge":
-    #   Scale features (StandardScaler fit on train only), fit Ridge, predict on val,
-    #   print average pixel distance between predicted and actual screen coords, save model file.
-    #
-    # TODO 4 — If model == "mlp":
-    #   Same scaler/split. Train a small network (input = feature count, output = 2 for x,y).
-    #   Save weights to models/{profile}/.
-    #
-    # Test: python -m gaze_mouse train --profile test1 --model ridge
+    data_path = calibration_data_path(profile)
+    if not data_path.is_file():
+        print(f"calibration not found: {data_path}")
+        return 1
+    archive = np.load(data_path)
+    X = archive["X"]
+    y = archive["y"]
+    point_ids = archive["point_ids"]
+    saved_version = int(archive["feature_version"]) if "feature_version" in archive else None
+    val_point_ids = default_val_point_ids(config.calibration.grid)
+    train_X, train_y, val_X, val_y = split_train_val(X, y, point_ids, val_point_ids)
+    scaler = StandardScaler()
+    scaler.fit(train_X)
+    train_X_scaled = np.asarray(scaler.transform(train_X), dtype=np.float64)
+    val_X_scaled = np.asarray(scaler.transform(val_X), dtype=np.float64)
+    expected_dim = feature_dim()
+    if train_X.shape[1] != expected_dim:
+        print(
+            f"warning: calibration features have dim {train_X.shape[1]}, "
+            f"expected {expected_dim} for FEATURE_VERSION {FEATURE_VERSION} — recalibrate"
+        )
+    elif saved_version is not None and saved_version != FEATURE_VERSION:
+        print(
+            f"warning: .npz feature_version={saved_version} but code uses {FEATURE_VERSION} — recalibrate"
+        )
+    print(f"features: version {FEATURE_VERSION}, dim {expected_dim}")
 
+    if model == "ridge":
+        regressor: Any = RidgeCV(alphas=np.logspace(-1, 4, 40))
+        regressor.fit(train_X_scaled, train_y)
+        train_pred = regressor.predict(train_X_scaled)
+        val_pred = regressor.predict(val_X_scaled)
+        train_error_px = mean_pixel_error(train_y, train_pred)
+        val_error_px = mean_pixel_error(val_y, val_pred)
+        artifact_path = save_gaze_artifact(profile, regressor, scaler, model, val_point_ids)
+        checkpoint_note = ""
+    elif model == "mlp":
+        result, y_scaler = train_gaze_mlp(
+            train_X_scaled, train_y, val_X_scaled, val_y, config.model
+        )
+        train_error_px = result.train_error_px
+        val_error_px = result.val_error_px
+        ckpt_path = mlp_checkpoint_path(profile)
+        save_mlp_checkpoint(
+            ckpt_path,
+            result.predictor,
+            input_dim=int(train_X.shape[1]),
+            hidden=config.model.hidden,
+            best_epoch=result.best_epoch,
+            device=result.device,
+        )
+        artifact_path = save_gaze_artifact(
+            profile, result.predictor, scaler, model, val_point_ids
+        )
+        checkpoint_note = f"\nsaved checkpoint to {ckpt_path} (best epoch {result.best_epoch})"
+    else:
+        raise ValueError(f"unknown model: {model}")
+
+    print(f"train mean pixel error: {train_error_px:.1f} px")
+    print(f"val mean pixel error: {val_error_px:.1f} px (held-out points {val_point_ids})")
+    if val_error_px > 100:
+        print("warning: val error > 100 px — improve model/calibration before relying on run")
+    elif val_error_px <= 50:
+        print("val error within stretch target (<= 50 px)")
+    print(f"saved model to {artifact_path}{checkpoint_note}")
     return 0
+
 
 def cmd_eval(config: AppConfig, profile: str) -> int:
     """
@@ -313,18 +513,43 @@ def cmd_eval(config: AppConfig, profile: str) -> int:
     int
         0 after printing metrics, non-zero if files missing.
     """
-    # --- Phase 4: eval (not started) ---
-    #
-    # Goal: report how accurate the trained model is on dots it did NOT train on.
-    #
-    # TODO 1 — Load the same .npz and saved model files that train produced.
-    #
-    # TODO 2 — Use the same validation split as train. Run predict on val features.
-    #
-    # TODO 3 — Print mean pixel error (average distance between predicted and true screen coords).
-    #
-    # Test: python -m gaze_mouse eval --profile test1
-
+    data_path = calibration_data_path(profile)
+    if not data_path.is_file():
+        print(f"calibration not found: {data_path}")
+        return 1
+    try:
+        bundle = load_gaze_artifact(profile)
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(exc)
+        return 1
+    regressor = bundle["model"]
+    scaler = bundle["scaler"]
+    saved_val_ids = tuple(int(x) for x in bundle.get("val_point_ids", []))
+    val_point_ids = saved_val_ids or default_val_point_ids(config.calibration.grid)
+    X, y, point_ids = load_calibration_arrays(profile)
+    train_X, train_y, val_X, val_y = split_train_val(X, y, point_ids, val_point_ids)
+    train_X_scaled = scaler.transform(train_X)
+    val_X_scaled = scaler.transform(val_X)
+    train_pred = regressor.predict(train_X_scaled)
+    val_pred = regressor.predict(val_X_scaled)
+    train_error_px = mean_pixel_error(train_y, train_pred)
+    val_error_px = mean_pixel_error(val_y, val_pred)
+    model_type = bundle.get("model_type", "unknown")
+    print(f"model: {model_type}  profile: {profile}")
+    print(f"train mean pixel error: {train_error_px:.1f} px")
+    print(f"val mean pixel error: {val_error_px:.1f} px (held-out points {val_point_ids})")
+    for point_id in sorted(set(int(p) for p in val_point_ids)):
+        mask = point_ids == point_id
+        if not np.any(mask):
+            continue
+        point_X = scaler.transform(X[mask])
+        point_pred = regressor.predict(point_X)
+        point_error = mean_pixel_error(y[mask], point_pred)
+        print(f"  point {point_id}: {point_error:.1f} px ({int(np.sum(mask))} samples)")
+    if val_error_px > 100:
+        print("warning: val error > 100 px — tune calibration/model before daily use")
+    elif val_error_px <= 50:
+        print("val error within stretch target (<= 50 px)")
     return 0
 
 
@@ -346,22 +571,102 @@ def cmd_run(config: AppConfig, profile: str) -> int:
     int
         0 on clean exit, non-zero on startup error.
     """
-    # --- Phase 5: live mouse (not started) ---
-    #
-    # Goal: same loop as preview, but instead of showing a window, move the real mouse cursor.
-    #
-    # TODO 1 — Load the trained model + scaler for profile (same files train saved).
-    #
-    # TODO 2 — open_camera + FaceMesh loop. Each frame: features → model.predict → (x, y) pixels.
-    #
-    # TODO 3 — Apply config.gaze gain (scale movement), smooth between frames (reduce jitter),
-    #   then set mouse position with pynput (library that moves the OS cursor).
-    #
-    # TODO 4 — Esc key sets a "killed" flag; stop moving mouse when flag is set.
-    #   If face not detected for config.safety.face_lost_frames in a row, stop moving too.
-    #
-    # Test: python -m gaze_mouse run --profile test1
+    try:
+        bundle = load_gaze_artifact(profile)
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(exc)
+        return 1
+    regressor = bundle["model"]
+    scaler = bundle["scaler"]
+    screen_width, screen_height = get_screen_size(config.screen.mode)
+    show_system_cursor()
+    mouse_controller = mouse.Controller()
+    start_pos = mouse_controller.position
+    smooth_x, smooth_y = float(start_pos[0]), float(start_pos[1])
+    killed = False
+    warmup_frames = 15
+    stable_face_frames = 0
+    control_enabled = False
 
+    def on_press(key: keyboard.Key | keyboard.KeyCode | None) -> None:
+        nonlocal killed
+        if key == keyboard.Key.esc:
+            killed = True
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    print(
+        f"gaze-mouse run on {screen_width}x{screen_height}. "
+        "Keep face in frame. Esc or q to stop. Cursor starts where it is now."
+    )
+    face_mesh = FaceMesh(max_num_faces=1, refine_landmarks=True)
+    cap = open_camera(config.camera.index, config.camera.width, config.camera.height)
+    face_lost_streak = 0
+    smoothed_features: np.ndarray | None = None
+    frame_interval_s = 1.0 / max(config.camera.fps_target, 1)
+    try:
+        while not killed:
+            loop_start = time.perf_counter()
+            ok, frame = cap.read()
+            if not ok:
+                print("camera read failed")
+                return 1
+            multi_face_landmarks = detect_face_landmarks(frame, face_mesh)
+            if multi_face_landmarks is None:
+                face_lost_streak += 1
+                smoothed_features = None
+                if control_enabled and face_lost_streak >= config.safety.face_lost_frames:
+                    continue
+            else:
+                face_lost_streak = 0
+                if not control_enabled:
+                    stable_face_frames += 1
+                    if stable_face_frames < warmup_frames:
+                        if stable_face_frames in (5, 10, 15) or stable_face_frames == warmup_frames - 1:
+                            print(f"warmup: {stable_face_frames}/{warmup_frames} (keep face in frame)")
+                        continue
+                    control_enabled = True
+                    print("face stable — cursor control enabled.")
+                features = extract_feature_vector(multi_face_landmarks)
+                if features is None:
+                    continue
+                alpha = config.gaze.smoothing_alpha
+                if smoothed_features is None:
+                    smoothed_features = features.copy()
+                else:
+                    smoothed_features = (
+                        alpha * features + (1.0 - alpha) * smoothed_features
+                    ).astype(np.float32)
+                raw_x, raw_y = predict_screen_position(regressor, scaler, smoothed_features)
+                if not (math.isfinite(raw_x) and math.isfinite(raw_y)):
+                    continue
+                if not (
+                    -screen_width <= raw_x <= 2 * screen_width
+                    and -screen_height <= raw_y <= 2 * screen_height
+                ):
+                    continue
+                smooth_x, smooth_y = apply_gaze_mapping(
+                    raw_x,
+                    raw_y,
+                    screen_width,
+                    screen_height,
+                    config.gaze,
+                    smooth_x,
+                    smooth_y,
+                )
+                mouse_controller.position = (int(smooth_x), int(smooth_y))
+            elapsed = time.perf_counter() - loop_start
+            if elapsed < frame_interval_s:
+                time.sleep(frame_interval_s - elapsed)
+            if cv2.waitKey(1) == ord("q"):
+                break
+    finally:
+        listener.stop()
+        cap.release()
+        face_mesh.close()
+        cv2.destroyAllWindows()
+        restore_cursor_to_center(screen_width, screen_height)
+    print("stopped — cursor moved to screen center.")
     return 0
 
 def main(argv: list[str] | None = None) -> int:

@@ -21,14 +21,16 @@ safety:
 
 calibration:
   grid: 3x3
-  samples_per_point: 45
-  dwell_ms_to_start: 400
+  # More samples + longer dwell usually lowers val error (v3 eye features need recalibrate).
+  samples_per_point: 80
+  dwell_ms_to_start: 600
 
 model:
-  type: mlp
-  hidden: [128, 64]
-  learning_rate: 0.001
-  epochs: 200
-  batch_size: 64
+  type: ridge
+  # ridge first; try mlp after ridge val improves. Small net matches ~84-D eye features.
+  hidden: [48, 24]
+  learning_rate: 0.0005
+  epochs: 400
+  batch_size: 32
 
 profile: default
