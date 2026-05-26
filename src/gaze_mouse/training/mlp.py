@@ -13,15 +13,12 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
 from gaze_mouse.config import ModelConfig
+from gaze_mouse.training.device import pick_device
 from gaze_mouse.training.metrics import mean_pixel_error
 
 # Stop if validation error does not improve for this many epochs.
 EARLY_STOPPING_PATIENCE = 30
 DROPOUT = 0.35
-
-
-def pick_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class GazeMLP(nn.Module):

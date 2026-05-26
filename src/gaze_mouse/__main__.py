@@ -20,23 +20,30 @@ from pynput import keyboard, mouse
 from gaze_mouse.config import AppConfig, GazeConfig, load_config, project_root
 from gaze_mouse.features import FEATURE_VERSION, extract_feature_vector, feature_dim
 from gaze_mouse.training.metrics import mean_pixel_error
+from gaze_mouse.training.cnn import (
+    CnnTrainResult,
+    load_cnn_predictor,
+    save_cnn_checkpoint,
+    train_gaze_cnn,
+)
 from gaze_mouse.training.mlp import (
     TrainResult,
     load_mlp_predictor,
     save_mlp_checkpoint,
     train_gaze_mlp,
 )
-
-# Grid points held out for validation (same split for train, eval, run checks).
-DEFAULT_VAL_POINT_IDS: tuple[int, ...] = (2, 7)
+from gaze_mouse.calibration.dataset import (
+    append_calibration_arrays,
+    estimate_calibration_minutes,
+    val_point_ids_for_grid,
+)
+from gaze_mouse.vision.eye_crop import extract_eye_crop
 
 
 def default_val_point_ids(grid: str) -> tuple[int, ...]:
-    """Return calibration point ids to hold out for validation (~2 corners on 3x3)."""
+    """Return calibration point ids held out for validation (corner dots)."""
     rows, cols = parse_calibration_grid(grid)
-    if rows * cols >= 9:
-        return DEFAULT_VAL_POINT_IDS
-    return (rows * cols - 1,)
+    return val_point_ids_for_grid(rows, cols)
 
 
 def calibration_data_path(profile: str) -> Path:
@@ -49,6 +56,10 @@ def model_artifact_path(profile: str) -> Path:
 
 def mlp_checkpoint_path(profile: str) -> Path:
     return project_root() / "models" / profile / "mlp.pt"
+
+
+def cnn_checkpoint_path(profile: str) -> Path:
+    return project_root() / "models" / profile / "cnn.pt"
 
 
 def load_calibration_arrays(profile: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -86,6 +97,10 @@ def save_gaze_artifact(
     if model_type == "mlp":
         bundle["model"] = None
         bundle["y_scaler"] = model.y_scaler
+    elif model_type == "cnn":
+        bundle["model"] = None
+        bundle["y_scaler"] = model.y_scaler
+        bundle["crop_size"] = int(model.crop_size)
     else:
         bundle["model"] = model
     joblib.dump(bundle, path)
@@ -104,8 +119,11 @@ def load_gaze_artifact(profile: str) -> dict[str, Any]:
         if model_type == "mlp":
             ckpt = mlp_checkpoint_path(profile)
             bundle["model"] = load_mlp_predictor(ckpt, y_scaler=bundle.get("y_scaler"))
+        elif model_type == "cnn":
+            ckpt = cnn_checkpoint_path(profile)
+            bundle["model"] = load_cnn_predictor(ckpt)
         elif bundle.get("model") is None:
-            raise RuntimeError(f"mlp checkpoint missing for profile {profile}; retrain with --model mlp")
+            raise RuntimeError(f"checkpoint missing for profile {profile}; retrain")
         return bundle
     if legacy.is_file():
         raise RuntimeError(
@@ -120,9 +138,19 @@ def load_gaze_artifact(profile: str) -> dict[str, Any]:
 def predict_screen_position(
     model: Any,
     scaler: StandardScaler,
-    features: np.ndarray | list[float],
+    model_type: str,
+    *,
+    features: np.ndarray | None = None,
+    crop_bgr: np.ndarray | None = None,
 ) -> tuple[float, float]:
-    """Scale landmark features and predict screen (x, y) in pixels."""
+    """Predict screen (x, y) from features (ridge/mlp) or eye crop (cnn)."""
+    if model_type == "cnn":
+        if crop_bgr is None:
+            raise ValueError("cnn model requires crop_bgr")
+        pred = model.predict(crop_bgr)
+        return float(pred[0]), float(pred[1])
+    if features is None:
+        raise ValueError(f"{model_type} model requires features")
     row = np.asarray(features, dtype=np.float32).reshape(1, -1)
     scaled = scaler.transform(row)
     pred = model.predict(scaled)[0]
@@ -165,6 +193,46 @@ def parse_calibration_grid(grid: str) -> tuple[int, int]:
     """Parse a grid string like '3x3' into (rows, cols)."""
     rows_s, cols_s = grid.lower().split("x")
     return int(rows_s), int(cols_s)
+
+
+def calibration_point_hint(point_id: int, rows: int, cols: int) -> str:
+    """Human-readable position for on-screen calibration help."""
+    if point_id < 0 or point_id >= rows * cols:
+        return f"dot {point_id}"
+    row = point_id // cols
+    col = point_id % cols
+    vert = "top" if row == 0 else ("bottom" if row == rows - 1 else "middle")
+    horiz = "left" if col == 0 else ("right" if col == cols - 1 else "center")
+    if vert == "middle" and horiz == "center":
+        region = "center"
+    elif vert == "middle":
+        region = horiz
+    elif horiz == "center":
+        region = vert
+    else:
+        region = f"{vert}-{horiz}"
+    return f"dot {point_id} ({region}) — look at the white circle"
+
+
+def draw_calibration_target(
+    screen: pygame.Surface,
+    target_x: int,
+    target_y: int,
+    point_id: int,
+    rows: int,
+    cols: int,
+    collected: int,
+    quota: int,
+) -> None:
+    """Draw dot, id label, and sample progress."""
+    screen.fill((40, 40, 40))
+    pygame.draw.circle(screen, (255, 255, 255), (target_x, target_y), 12)
+    font = pygame.font.SysFont(None, 32)
+    hint = calibration_point_hint(point_id, rows, cols)
+    label = font.render(hint, True, (220, 220, 220))
+    screen.blit(label, (24, 24))
+    progress = font.render(f"samples {collected}/{quota}", True, (180, 180, 180))
+    screen.blit(progress, (24, 56))
 
 
 def calibration_dot_positions(
@@ -296,7 +364,7 @@ def restore_cursor_to_center(screen_width: int, screen_height: int) -> None:
     show_system_cursor()
 
 
-def cmd_calibrate(config: AppConfig, profile: str) -> int:
+def cmd_calibrate(config: AppConfig, profile: str, *, append: bool = False) -> int:
     """
     Parameters
     ----------
@@ -324,10 +392,25 @@ def cmd_calibrate(config: AppConfig, profile: str) -> int:
     screen_width, screen_height = get_screen_size(config.screen.mode)
     # Compute screen pixel center for each grid dot (10% inset from edges).
     dot_positions = calibration_dot_positions(rows, cols, screen_width, screen_height)
+    val_ids = val_point_ids_for_grid(rows, cols)
+    est_min = estimate_calibration_minutes(
+        rows, cols, config.calibration.samples_per_point, config.calibration.dwell_ms_to_start
+    )
+    print(
+        f"calibration: {config.calibration.grid}  {config.calibration.samples_per_point} samples/dot  "
+        f"~{est_min:.0f} min per pass  val hold-out dots {val_ids}"
+    )
+    if append:
+        print("append mode: new samples will be added to existing .npz (same grid & features)")
+    else:
+        print("tip: run again with --append to double data without replacing the file")
+
     # Lists that will become numpy arrays when we save the dataset.
     feature_rows: list[np.ndarray] = []
+    crop_rows: list[np.ndarray] = []
     label_rows: list[list[int]] = []
     point_id_rows: list[int] = []
+    crop_size = config.model.crop_size
     # Start pygame for fullscreen calibration targets.
     pygame.init()
     # Fullscreen surface covering the primary monitor.
@@ -339,30 +422,23 @@ def cmd_calibrate(config: AppConfig, profile: str) -> int:
     try:
         # Visit each calibration dot in order (row-major grid).
         for point_id, (target_x, target_y) in enumerate(dot_positions):
-            # Fill background dark gray for this target.
-            screen.fill((40, 40, 40))
-            # Draw the white dot where the user should look.
-            pygame.draw.circle(screen, (255, 255, 255), (target_x, target_y), 12)
-            # Push the frame to the display.
+            collected = 0
+            quota = config.calibration.samples_per_point
+            draw_calibration_target(
+                screen, target_x, target_y, point_id, rows, cols, collected, quota
+            )
             pygame.display.flip()
-            # Wait until dwell time passes so the user's gaze settles on the dot.
             dwell_deadline = time.perf_counter() + config.calibration.dwell_ms_to_start / 1000.0
             while time.perf_counter() < dwell_deadline:
-                # Esc during dwell cancels calibration without saving.
                 if pygame_escape_pressed():
                     return 1
-                # Small sleep so we do not busy-spin the CPU.
                 time.sleep(0.01)
-            # Count how many valid face samples we have collected for this dot.
-            collected = 0
-            # Keep sampling until we reach samples_per_point for this dot.
-            while collected < config.calibration.samples_per_point:
-                # Esc during sampling cancels calibration without saving.
+            while collected < quota:
                 if pygame_escape_pressed():
                     return 1
-                # Keep the target dot visible while sampling.
-                screen.fill((40, 40, 40))
-                pygame.draw.circle(screen, (255, 255, 255), (target_x, target_y), 12)
+                draw_calibration_target(
+                    screen, target_x, target_y, point_id, rows, cols, collected, quota
+                )
                 pygame.display.flip()
                 # Grab one frame from the webcam.
                 ok, frame = cap.read()
@@ -377,7 +453,11 @@ def cmd_calibrate(config: AppConfig, profile: str) -> int:
                 vec = extract_feature_vector(multi_face_landmarks)
                 if vec is None:
                     continue
+                crop = extract_eye_crop(frame, multi_face_landmarks, crop_size=crop_size)
+                if crop is None:
+                    continue
                 feature_rows.append(vec)
+                crop_rows.append(crop)
                 label_rows.append([target_x, target_y])
                 point_id_rows.append(point_id)
                 collected += 1
@@ -391,18 +471,41 @@ def cmd_calibrate(config: AppConfig, profile: str) -> int:
         restore_cursor_to_center(screen_width, screen_height)
     # Convert collected rows to numpy arrays for training.
     x_array = np.asarray(feature_rows, dtype=np.float32)
+    images_array = np.asarray(crop_rows, dtype=np.uint8)
     y_array = np.asarray(label_rows, dtype=np.float32)
     point_ids_array = np.asarray(point_id_rows, dtype=np.int32)
-    # Save dataset to disk (.npz = compressed numpy archive).
+
+    if append:
+        merged = append_calibration_arrays(
+            output_path,
+            x_array,
+            images_array,
+            y_array,
+            point_ids_array,
+            rows=rows,
+            cols=cols,
+            feature_version=FEATURE_VERSION,
+            crop_size=crop_size,
+        )
+        if merged is None:
+            return 1
+        x_array, images_array, y_array, point_ids_array = merged
+
     np.savez(
         output_path,
         X=x_array,
+        images=images_array,
         y=y_array,
         point_ids=point_ids_array,
         feature_version=np.int32(FEATURE_VERSION),
+        crop_size=np.int32(crop_size),
+        grid_rows=np.int32(rows),
+        grid_cols=np.int32(cols),
     )
-    # Tell the user where data was written and how many rows were saved.
-    print(f"saved {len(feature_rows)} samples to {output_path}")
+    print(
+        f"saved {x_array.shape[0]} samples to {output_path} "
+        f"(features {x_array.shape}, eye crops {images_array.shape})"
+    )
     # Successful calibration run.
     return 0
 
@@ -482,6 +585,38 @@ def cmd_train(config: AppConfig, profile: str, model: str) -> int:
             profile, result.predictor, scaler, model, val_point_ids
         )
         checkpoint_note = f"\nsaved checkpoint to {ckpt_path} (best epoch {result.best_epoch})"
+    elif model == "cnn":
+        if "images" not in archive:
+            print(
+                "calibration has no eye crops. re-run: python -m gaze_mouse calibrate --profile "
+                f"{profile}"
+            )
+            return 1
+        images = archive["images"]
+        val_mask = np.isin(point_ids, val_point_ids)
+        train_images = images[~val_mask]
+        val_images = images[val_mask]
+        print(
+            f"CNN: {train_images.shape[0]} train crops, {val_images.shape[0]} val crops, "
+            f"size {config.model.crop_size}x{config.model.crop_size}"
+        )
+        cnn_result: CnnTrainResult = train_gaze_cnn(
+            train_images, train_y, val_images, val_y, config.model
+        )
+        train_error_px = cnn_result.train_error_px
+        val_error_px = cnn_result.val_error_px
+        ckpt_path = cnn_checkpoint_path(profile)
+        save_cnn_checkpoint(
+            ckpt_path,
+            cnn_result.predictor,
+            crop_size=config.model.crop_size,
+            best_epoch=cnn_result.best_epoch,
+            device=cnn_result.device,
+        )
+        artifact_path = save_gaze_artifact(
+            profile, cnn_result.predictor, scaler, model, val_point_ids
+        )
+        checkpoint_note = f"\nsaved checkpoint to {ckpt_path} (best epoch {cnn_result.best_epoch})"
     else:
         raise ValueError(f"unknown model: {model}")
 
@@ -524,17 +659,35 @@ def cmd_eval(config: AppConfig, profile: str) -> int:
         return 1
     regressor = bundle["model"]
     scaler = bundle["scaler"]
+    model_type = str(bundle.get("model_type", "unknown"))
     saved_val_ids = tuple(int(x) for x in bundle.get("val_point_ids", []))
     val_point_ids = saved_val_ids or default_val_point_ids(config.calibration.grid)
-    X, y, point_ids = load_calibration_arrays(profile)
-    train_X, train_y, val_X, val_y = split_train_val(X, y, point_ids, val_point_ids)
-    train_X_scaled = scaler.transform(train_X)
-    val_X_scaled = scaler.transform(val_X)
-    train_pred = regressor.predict(train_X_scaled)
-    val_pred = regressor.predict(val_X_scaled)
+    archive = np.load(data_path)
+    y = archive["y"]
+    point_ids = archive["point_ids"]
+    val_mask = np.isin(point_ids, val_point_ids)
+    train_y = y[~val_mask]
+    val_y = y[val_mask]
+
+    if model_type == "cnn":
+        if "images" not in archive:
+            print("calibration missing eye crops — recalibrate first")
+            return 1
+        images = archive["images"]
+        train_pred = regressor.predict_batch(images[~val_mask])
+        val_pred = regressor.predict_batch(images[val_mask])
+        eval_images = images
+    else:
+        X = archive["X"]
+        train_X, _, val_X, _ = split_train_val(X, y, point_ids, val_point_ids)
+        train_X_scaled = np.asarray(scaler.transform(train_X), dtype=np.float64)
+        val_X_scaled = np.asarray(scaler.transform(val_X), dtype=np.float64)
+        train_pred = regressor.predict(train_X_scaled)
+        val_pred = regressor.predict(val_X_scaled)
+        eval_images = None
+
     train_error_px = mean_pixel_error(train_y, train_pred)
     val_error_px = mean_pixel_error(val_y, val_pred)
-    model_type = bundle.get("model_type", "unknown")
     print(f"model: {model_type}  profile: {profile}")
     print(f"train mean pixel error: {train_error_px:.1f} px")
     print(f"val mean pixel error: {val_error_px:.1f} px (held-out points {val_point_ids})")
@@ -542,8 +695,12 @@ def cmd_eval(config: AppConfig, profile: str) -> int:
         mask = point_ids == point_id
         if not np.any(mask):
             continue
-        point_X = scaler.transform(X[mask])
-        point_pred = regressor.predict(point_X)
+        if model_type == "cnn":
+            assert eval_images is not None
+            point_pred = regressor.predict_batch(eval_images[mask])
+        else:
+            point_X = np.asarray(scaler.transform(archive["X"][mask]), dtype=np.float64)
+            point_pred = regressor.predict(point_X)
         point_error = mean_pixel_error(y[mask], point_pred)
         print(f"  point {point_id}: {point_error:.1f} px ({int(np.sum(mask))} samples)")
     if val_error_px > 100:
@@ -578,6 +735,8 @@ def cmd_run(config: AppConfig, profile: str) -> int:
         return 1
     regressor = bundle["model"]
     scaler = bundle["scaler"]
+    model_type = str(bundle.get("model_type", "ridge"))
+    crop_size = int(bundle.get("crop_size", config.model.crop_size))
     screen_width, screen_height = get_screen_size(config.screen.mode)
     show_system_cursor()
     mouse_controller = mouse.Controller()
@@ -596,7 +755,7 @@ def cmd_run(config: AppConfig, profile: str) -> int:
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     print(
-        f"gaze-mouse run on {screen_width}x{screen_height}. "
+        f"gaze-mouse run ({model_type}) on {screen_width}x{screen_height}. "
         "Keep face in frame. Esc or q to stop. Cursor starts where it is now."
     )
     face_mesh = FaceMesh(max_num_faces=1, refine_landmarks=True)
@@ -627,17 +786,29 @@ def cmd_run(config: AppConfig, profile: str) -> int:
                         continue
                     control_enabled = True
                     print("face stable — cursor control enabled.")
-                features = extract_feature_vector(multi_face_landmarks)
-                if features is None:
-                    continue
-                alpha = config.gaze.smoothing_alpha
-                if smoothed_features is None:
-                    smoothed_features = features.copy()
+                if model_type == "cnn":
+                    crop = extract_eye_crop(
+                        frame, multi_face_landmarks, crop_size=crop_size
+                    )
+                    if crop is None:
+                        continue
+                    raw_x, raw_y = predict_screen_position(
+                        regressor, scaler, model_type, crop_bgr=crop
+                    )
                 else:
-                    smoothed_features = (
-                        alpha * features + (1.0 - alpha) * smoothed_features
-                    ).astype(np.float32)
-                raw_x, raw_y = predict_screen_position(regressor, scaler, smoothed_features)
+                    features = extract_feature_vector(multi_face_landmarks)
+                    if features is None:
+                        continue
+                    alpha = config.gaze.smoothing_alpha
+                    if smoothed_features is None:
+                        smoothed_features = features.copy()
+                    else:
+                        smoothed_features = (
+                            alpha * features + (1.0 - alpha) * smoothed_features
+                        ).astype(np.float32)
+                    raw_x, raw_y = predict_screen_position(
+                        regressor, scaler, model_type, features=smoothed_features
+                    )
                 if not (math.isfinite(raw_x) and math.isfinite(raw_y)):
                     continue
                 if not (
@@ -703,6 +874,11 @@ def main(argv: list[str] | None = None) -> int:
     run_parser = sub.add_parser("run")
     # Add optional --profile to calibrate so user can choose save/load profile name.
     calibrate_parser.add_argument("--profile", type=str, default=None)
+    calibrate_parser.add_argument(
+        "--append",
+        action="store_true",
+        help="add samples to existing .npz (same grid; run twice for ~2x data)",
+    )
     # Add optional --profile to train so user can pick which calibration data to train on.
     train_parser.add_argument("--profile", type=str, default=None)
     # Add optional --profile to eval so user can pick which trained model profile to evaluate.
@@ -710,7 +886,9 @@ def main(argv: list[str] | None = None) -> int:
     # Add optional --profile to run so user can pick which trained model profile to run live.
     run_parser.add_argument("--profile", type=str, default=None)
     # Add optional --model to train to choose algorithm; default comes from config if omitted.
-    train_parser.add_argument("--model", type=str, choices=["ridge", "mlp"], default=None)
+    train_parser.add_argument(
+        "--model", type=str, choices=["ridge", "mlp", "cnn"], default=None
+    )
     # Parse CLI args (or passed argv for testing).
     args = parser.parse_args(argv)
     # If user passed --config, load that exact file path.
@@ -727,7 +905,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_preview(config)
     # Dispatch calibrate command to data collection flow.
     elif args.command == "calibrate":
-        return cmd_calibrate(config, profile)
+        return cmd_calibrate(config, profile, append=args.append)
     # Dispatch train command to model training flow.
     elif args.command == "train":
         # Use CLI --model when provided; otherwise use model type from config.

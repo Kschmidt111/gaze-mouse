@@ -3,7 +3,10 @@ opencv-python==4.10.0.84
 mediapipe==0.10.21
 numpy==1.26.4
 scikit-learn==1.5.2
-torch==2.5.1
+# GPU (RTX): pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# CPU-only fallback: pip install torch==2.5.1
+torch>=2.5.1
+torchvision>=0.20.0
 PyYAML==6.0.2
 pynput==1.7.7
 pygame==2.6.1

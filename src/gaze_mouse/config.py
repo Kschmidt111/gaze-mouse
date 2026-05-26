@@ -51,6 +51,7 @@ class ModelConfig:
     learning_rate: float
     epochs: int
     batch_size: int
+    crop_size: int
 
 
 @dataclass
@@ -136,6 +137,7 @@ def _parse_model(raw: dict[str, Any]) -> ModelConfig:
         learning_rate=raw["learning_rate"],
         epochs=raw["epochs"],
         batch_size=raw["batch_size"],
+        crop_size=int(raw.get("crop_size", 128)),
     )
 
 
