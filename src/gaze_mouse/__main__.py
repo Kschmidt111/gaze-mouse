@@ -37,6 +37,7 @@ from gaze_mouse.calibration.dataset import (
     estimate_calibration_minutes,
     val_point_ids_for_grid,
 )
+from gaze_mouse.gaze_filter import GazeStabilizer
 from gaze_mouse.vision.eye_crop import extract_eye_crop
 
 
@@ -121,7 +122,11 @@ def load_gaze_artifact(profile: str) -> dict[str, Any]:
             bundle["model"] = load_mlp_predictor(ckpt, y_scaler=bundle.get("y_scaler"))
         elif model_type == "cnn":
             ckpt = cnn_checkpoint_path(profile)
-            bundle["model"] = load_cnn_predictor(ckpt)
+            feat_scaler = bundle.get("scaler")
+            if isinstance(feat_scaler, StandardScaler):
+                bundle["model"] = load_cnn_predictor(ckpt, x_scaler=feat_scaler)
+            else:
+                bundle["model"] = load_cnn_predictor(ckpt)
         elif bundle.get("model") is None:
             raise RuntimeError(f"checkpoint missing for profile {profile}; retrain")
         return bundle
@@ -147,7 +152,9 @@ def predict_screen_position(
     if model_type == "cnn":
         if crop_bgr is None:
             raise ValueError("cnn model requires crop_bgr")
-        pred = model.predict(crop_bgr)
+        if getattr(model, "fusion", False) and features is None:
+            raise ValueError("fusion cnn requires features")
+        pred = model.predict(crop_bgr, features=features)
         return float(pred[0]), float(pred[1])
     if features is None:
         raise ValueError(f"{model_type} model requires features")
@@ -166,7 +173,7 @@ def apply_gaze_mapping(
     prev_x: float | None,
     prev_y: float | None,
 ) -> tuple[float, float]:
-    """Apply center-relative gain, EMA smoothing, and max jump clamp."""
+    """One smoothing step: gain from center, EMA toward target, optional jump cap."""
     center_x = screen_width / 2.0
     center_y = screen_height / 2.0
     target_x = center_x + (raw_x - center_x) * gaze.gain_x
@@ -180,13 +187,14 @@ def apply_gaze_mapping(
         dx = smooth_x - prev_x
         dy = smooth_y - prev_y
         dist = float(np.hypot(dx, dy))
-        if dist > gaze.max_jump_px and dist > 0:
+        if gaze.max_jump_px > 0 and dist > gaze.max_jump_px:
             scale = gaze.max_jump_px / dist
             smooth_x = prev_x + dx * scale
             smooth_y = prev_y + dy * scale
-    clamped_x = float(np.clip(smooth_x, 0, screen_width - 1))
-    clamped_y = float(np.clip(smooth_y, 0, screen_height - 1))
-    return clamped_x, clamped_y
+    return (
+        float(np.clip(smooth_x, 0, screen_width - 1)),
+        float(np.clip(smooth_y, 0, screen_height - 1)),
+    )
 
 
 def parse_calibration_grid(grid: str) -> tuple[int, int]:
@@ -394,11 +402,15 @@ def cmd_calibrate(config: AppConfig, profile: str, *, append: bool = False) -> i
     dot_positions = calibration_dot_positions(rows, cols, screen_width, screen_height)
     val_ids = val_point_ids_for_grid(rows, cols)
     est_min = estimate_calibration_minutes(
-        rows, cols, config.calibration.samples_per_point, config.calibration.dwell_ms_to_start
+        rows,
+        cols,
+        config.calibration.samples_per_point,
+        config.calibration.dwell_ms_to_start,
+        fps=float(config.camera.fps_target),
     )
     print(
         f"calibration: {config.calibration.grid}  {config.calibration.samples_per_point} samples/dot  "
-        f"~{est_min:.0f} min per pass  val hold-out dots {val_ids}"
+        f"~{est_min:.1f} min per pass  val hold-out dots {val_ids}"
     )
     if append:
         print("append mode: new samples will be added to existing .npz (same grid & features)")
@@ -510,7 +522,7 @@ def cmd_calibrate(config: AppConfig, profile: str, *, append: bool = False) -> i
     return 0
 
 
-def cmd_train(config: AppConfig, profile: str, model: str) -> int:
+def cmd_train(config: AppConfig, profile: str, model: str, *, train_final: bool = False) -> int:
     """
     Parameters
     ----------
@@ -596,12 +608,24 @@ def cmd_train(config: AppConfig, profile: str, model: str) -> int:
         val_mask = np.isin(point_ids, val_point_ids)
         train_images = images[~val_mask]
         val_images = images[val_mask]
+        train_X_cnn = X[~val_mask]
+        val_X_cnn = X[val_mask]
+        backbone = config.model.backbone
         print(
-            f"CNN: {train_images.shape[0]} train crops, {val_images.shape[0]} val crops, "
-            f"size {config.model.crop_size}x{config.model.crop_size}"
+            f"CNN+fusion ({backbone}): {train_images.shape[0]} train, {val_images.shape[0]} val, "
+            f"crops {config.model.crop_size}x{config.model.crop_size}, features dim {train_X_cnn.shape[1]}"
+            + ("  --final: deploy retrain on all dots after holdout tuning" if train_final else "")
         )
         cnn_result: CnnTrainResult = train_gaze_cnn(
-            train_images, train_y, val_images, val_y, config.model
+            train_images,
+            train_X_cnn,
+            train_y,
+            val_images,
+            val_X_cnn,
+            val_y,
+            config.model,
+            backbone=backbone,
+            train_final=train_final,
         )
         train_error_px = cnn_result.train_error_px
         val_error_px = cnn_result.val_error_px
@@ -674,10 +698,13 @@ def cmd_eval(config: AppConfig, profile: str) -> int:
             print("calibration missing eye crops — recalibrate first")
             return 1
         images = archive["images"]
-        train_pred = regressor.predict_batch(images[~val_mask])
-        val_pred = regressor.predict_batch(images[val_mask])
+        X_all = archive["X"]
+        train_pred = regressor.predict_batch(images[~val_mask], X_all[~val_mask])
+        val_pred = regressor.predict_batch(images[val_mask], X_all[val_mask])
         eval_images = images
+        eval_features = X_all
     else:
+        eval_features = None
         X = archive["X"]
         train_X, _, val_X, _ = split_train_val(X, y, point_ids, val_point_ids)
         train_X_scaled = np.asarray(scaler.transform(train_X), dtype=np.float64)
@@ -697,7 +724,10 @@ def cmd_eval(config: AppConfig, profile: str) -> int:
             continue
         if model_type == "cnn":
             assert eval_images is not None
-            point_pred = regressor.predict_batch(eval_images[mask])
+            assert eval_features is not None
+            point_pred = regressor.predict_batch(
+                eval_images[mask], eval_features[mask]
+            )
         else:
             point_X = np.asarray(scaler.transform(archive["X"][mask]), dtype=np.float64)
             point_pred = regressor.predict(point_X)
@@ -762,7 +792,12 @@ def cmd_run(config: AppConfig, profile: str) -> int:
     cap = open_camera(config.camera.index, config.camera.width, config.camera.height)
     face_lost_streak = 0
     smoothed_features: np.ndarray | None = None
+    stabilizer = GazeStabilizer(
+        prediction_alpha=config.gaze.prediction_alpha,
+        outlier_px=config.gaze.prediction_outlier_px,
+    )
     frame_interval_s = 1.0 / max(config.camera.fps_target, 1)
+    feat_alpha = config.gaze.feature_smoothing_alpha
     try:
         while not killed:
             loop_start = time.perf_counter()
@@ -774,6 +809,7 @@ def cmd_run(config: AppConfig, profile: str) -> int:
             if multi_face_landmarks is None:
                 face_lost_streak += 1
                 smoothed_features = None
+                stabilizer.reset()
                 if control_enabled and face_lost_streak >= config.safety.face_lost_frames:
                     continue
             else:
@@ -790,24 +826,44 @@ def cmd_run(config: AppConfig, profile: str) -> int:
                     crop = extract_eye_crop(
                         frame, multi_face_landmarks, crop_size=crop_size
                     )
-                    if crop is None:
+                    features = extract_feature_vector(multi_face_landmarks)
+                    if crop is None or features is None:
                         continue
+                    if feat_alpha > 0:
+                        if smoothed_features is None:
+                            smoothed_features = features.copy()
+                        else:
+                            smoothed_features = (
+                                feat_alpha * features
+                                + (1.0 - feat_alpha) * smoothed_features
+                            ).astype(np.float32)
+                        feat_for_pred = smoothed_features
+                    else:
+                        feat_for_pred = features
                     raw_x, raw_y = predict_screen_position(
-                        regressor, scaler, model_type, crop_bgr=crop
+                        regressor,
+                        scaler,
+                        model_type,
+                        features=feat_for_pred,
+                        crop_bgr=crop,
                     )
                 else:
                     features = extract_feature_vector(multi_face_landmarks)
                     if features is None:
                         continue
-                    alpha = config.gaze.smoothing_alpha
-                    if smoothed_features is None:
-                        smoothed_features = features.copy()
+                    if feat_alpha > 0:
+                        if smoothed_features is None:
+                            smoothed_features = features.copy()
+                        else:
+                            smoothed_features = (
+                                feat_alpha * features
+                                + (1.0 - feat_alpha) * smoothed_features
+                            ).astype(np.float32)
+                        feat_for_pred = smoothed_features
                     else:
-                        smoothed_features = (
-                            alpha * features + (1.0 - alpha) * smoothed_features
-                        ).astype(np.float32)
+                        feat_for_pred = features
                     raw_x, raw_y = predict_screen_position(
-                        regressor, scaler, model_type, features=smoothed_features
+                        regressor, scaler, model_type, features=feat_for_pred
                     )
                 if not (math.isfinite(raw_x) and math.isfinite(raw_y)):
                     continue
@@ -816,9 +872,10 @@ def cmd_run(config: AppConfig, profile: str) -> int:
                     and -screen_height <= raw_y <= 2 * screen_height
                 ):
                     continue
+                stable_x, stable_y = stabilizer.filter_prediction(raw_x, raw_y)
                 smooth_x, smooth_y = apply_gaze_mapping(
-                    raw_x,
-                    raw_y,
+                    stable_x,
+                    stable_y,
                     screen_width,
                     screen_height,
                     config.gaze,
@@ -889,6 +946,11 @@ def main(argv: list[str] | None = None) -> int:
     train_parser.add_argument(
         "--model", type=str, choices=["ridge", "mlp", "cnn"], default=None
     )
+    train_parser.add_argument(
+        "--final",
+        action="store_true",
+        help="CNN only: after holdout tuning, retrain on all grid points for run (corners included)",
+    )
     # Parse CLI args (or passed argv for testing).
     args = parser.parse_args(argv)
     # If user passed --config, load that exact file path.
@@ -910,7 +972,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "train":
         # Use CLI --model when provided; otherwise use model type from config.
         model = args.model if args.model else config.model.type
-        return cmd_train(config, profile, model)
+        return cmd_train(config, profile, model, train_final=bool(args.final))
     # Dispatch eval command to offline evaluation flow.
     elif args.command == "eval":
         return cmd_eval(config, profile)

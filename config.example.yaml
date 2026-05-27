@@ -11,8 +11,11 @@ screen:
 gaze:
   gain_x: 1.0
   gain_y: 1.0
-  smoothing_alpha: 0.25
-  max_jump_px: 120
+  prediction_alpha: 0.28
+  prediction_outlier_px: 100
+  feature_smoothing_alpha: 0.4
+  smoothing_alpha: 0.22
+  max_jump_px: 50
 
 safety:
   kill_key: escape
@@ -26,9 +29,10 @@ calibration:
 
 model:
   type: cnn
+  backbone: resnet18
   crop_size: 128
   hidden: [48, 24]
-  learning_rate: 0.0003
+  learning_rate: 0.0001
   epochs: 250
   batch_size: 16
 

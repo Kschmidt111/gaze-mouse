@@ -29,12 +29,13 @@ def estimate_calibration_minutes(
     samples_per_point: int,
     dwell_ms: int,
     *,
-    seconds_per_sample: float = 0.12,
+    fps: float = 30.0,
 ) -> float:
-    """Rough duration for one full grid pass (face must be visible)."""
+    """Rough duration for one full grid pass (face visible; samples at ~camera rate)."""
     dots = rows * cols
     dwell_s = dwell_ms / 1000.0
-    return dots * (dwell_s + samples_per_point * seconds_per_sample) / 60.0
+    sample_s = samples_per_point / max(fps, 1.0)
+    return dots * (dwell_s + sample_s) / 60.0
 
 
 def append_calibration_arrays(

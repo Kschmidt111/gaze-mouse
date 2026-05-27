@@ -28,6 +28,9 @@ class GazeConfig:
     gain_y: float
     smoothing_alpha: float
     max_jump_px: float
+    feature_smoothing_alpha: float
+    prediction_alpha: float
+    prediction_outlier_px: float
 
 
 @dataclass
@@ -52,6 +55,7 @@ class ModelConfig:
     epochs: int
     batch_size: int
     crop_size: int
+    backbone: str
 
 
 @dataclass
@@ -111,6 +115,9 @@ def _parse_gaze(raw: dict[str, Any]) -> GazeConfig:
         gain_y=raw["gain_y"],
         smoothing_alpha=raw["smoothing_alpha"],
         max_jump_px=raw["max_jump_px"],
+        feature_smoothing_alpha=float(raw.get("feature_smoothing_alpha", 0.4)),
+        prediction_alpha=float(raw.get("prediction_alpha", 0.28)),
+        prediction_outlier_px=float(raw.get("prediction_outlier_px", 100.0)),
     )
 
 
@@ -138,6 +145,7 @@ def _parse_model(raw: dict[str, Any]) -> ModelConfig:
         epochs=raw["epochs"],
         batch_size=raw["batch_size"],
         crop_size=int(raw.get("crop_size", 128)),
+        backbone=str(raw.get("backbone", "resnet18")),
     )
 
 
